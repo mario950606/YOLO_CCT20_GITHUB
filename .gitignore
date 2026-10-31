@@ -1,0 +1,30 @@
+# Configuración local con rutas privadas
+configs/config.yaml
+
+# Entornos y cachés
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Pesos y datasets (no publicar datos/modelos con licencia o tamaño elevado)
+weights/
+datasets/
+dataset*/
+*.pt
+*.pth
+*.onnx
+
+# Resultados experimentales generados
+results/
+resultados*/
+runs/
+*.log
+
+# Sistema operativo / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

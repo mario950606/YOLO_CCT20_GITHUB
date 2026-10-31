@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+05_gradcam.py — YOLO_CCT20 / Fase 5: interpretabilidad exploratoria.
+
+Genera mapas Grad-CAM guiados por la puntuación de clase de YOLOv8.
+No entrena ni modifica los pesos. No vuelve a ejecutar la evaluación global.
+
+IMPORTANTE:
+- En detectores YOLO, Grad-CAM requiere definir una puntuación diferenciable.
+  Este script usa el máximo logit de la clase seleccionada en las salidas
+  multiescala sin decodificar del head Detect.
+- El mapa explica la evidencia espacial asociada a esa clase en la imagen;
+  no es una explicación causal ni una atribución exacta de una caja concreta.
+- TARGET_LAYER_INDEX=9 es el índice exploratorio del notebook. Debe comprobarse
+  en la arquitectura concreta del best.pt. Se puede cambiar por CLI.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import yaml
+from PIL import Image
+
+PROJECT_DEFAULT = Path(".")
+DATASET_DEFAULT = PROJECT_DEFAULT / "data/dataset_yolo"
+MODEL_DEFAULT = Path("weights/best.pt")
+OUTPUT_DEFAULT = PROJECT_DEFAULT / "results" / "05_interpretabilidad"
+SPLITS = ("cis_test", "trans_test")
+TARGET_LAYER_DEFAULT = 9
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def list_images(dataset: Path, split: str) -> list[Path]:
+    folder = dataset / "images" / split
+    if not folder.is_dir():
+        raise FileNotFoundError(f"No existe el directorio de imágenes: {folder}")
+    return sorted(p for p in folder.rglob("*")
+                  if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+
+def choose_images(dataset: Path, split: str, requested: list[str] | None,
+                  limit: int) -> list[Path]:
+    all_images = list_images(dataset, split)
+    if requested:
+        selected = []
+        for raw in requested:
+            p = Path(raw)
+            candidate = p if p.is_absolute() else dataset / "images" / split / p
+            if not candidate.is_file():
+                raise FileNotFoundError(f"No se encuentra la imagen solicitada: {candidate}")
+            selected.append(candidate)
+        return selected
+    # Selección determinista: primeras imágenes con etiqueta no vacía.
+    label_dir = dataset / "labels" / split
+    selected = []
+    for img in all_images:
+        label = label_dir / img.relative_to(dataset / "images" / split).with_suffix(".txt")
+        if label.is_file() and label.stat().st_size > 0:
+            selected.append(img)
+        if len(selected) >= limit:
+            break
+    if not selected:
+        raise RuntimeError(
+            f"No se encontraron imágenes con objetos anotados en {split}. "
+            "Indique imágenes explícitamente con --images."
+        )
+    return selected
+
+
+def raw_detect_outputs(output: Any) -> list:
+    """Extrae feature maps crudos de Detect en distintas versiones Ultralytics."""
+    candidate = output
+    if isinstance(candidate, tuple):
+        # En train mode, Detect normalmente retorna list[tensor].
+        candidate = candidate[0]
+    if isinstance(candidate, (list, tuple)) and candidate and all(
+        hasattr(x, "ndim") and x.ndim == 4 for x in candidate
+    ):
+        return list(candidate)
+    raise RuntimeError(
+        "El head Detect no devolvió mapas crudos [B,C,H,W]. "
+        "La versión de Ultralytics puede tener una API distinta."
+    )
+
+
+def build_cam(model_path: Path, image_path: Path, layer_index: int,
+              imgsz: int, device: str, conf: float, class_id: int | None,
+              output_dir: Path) -> dict[str, Any]:
+    import cv2
+    import torch
+    from ultralytics import YOLO
+
+    yolo = YOLO(str(model_path))
+    core = yolo.model
+    core.eval()
+    if not hasattr(core, "model") or len(core.model) == 0:
+        raise RuntimeError("No se pudo inspeccionar la arquitectura interna YOLO.")
+    if layer_index < 0 or layer_index >= len(core.model):
+        raise IndexError(
+            f"TARGET_LAYER_INDEX={layer_index} fuera de rango. "
+            f"Índices válidos: 0 a {len(core.model)-1}."
+        )
+    detect_head = core.model[-1]
+    target_layer = core.model[layer_index]
+    class_names = yolo.names
+    if isinstance(class_names, dict):
+        class_names = [class_names[i] for i in range(len(class_names))]
+    class_names = [str(x) for x in class_names]
+    n_classes = len(class_names)
+
+    # Primera pasada de inferencia normal para identificar una clase candidata.
+    prediction = yolo.predict(
+        source=str(image_path), imgsz=imgsz, conf=conf, device=device,
+        verbose=False, save=False
+    )[0]
+    boxes = prediction.boxes
+    if boxes is None or len(boxes) == 0:
+        raise RuntimeError(
+            f"Sin detecciones con conf>={conf:.3f}: {image_path.name}. "
+            "Pruebe otra imagen o reduzca --conf."
+        )
+    confidences = boxes.conf.detach().cpu().numpy()
+    predicted_classes = boxes.cls.detach().cpu().numpy().astype(int)
+    best_idx = int(np.argmax(confidences))
+    selected_class = int(predicted_classes[best_idx]) if class_id is None else int(class_id)
+    if not 0 <= selected_class < n_classes:
+        raise ValueError(f"class_id={selected_class} fuera del rango 0..{n_classes-1}")
+
+    # Grad-CAM: activa el modo de salida cruda SOLO en el head Detect.
+    # El resto de la red permanece en eval para mantener BatchNorm/Dropout estables.
+    activations: dict[str, Any] = {}
+    gradients: dict[str, Any] = {}
+
+    def forward_hook(module, inputs, output):
+        tensor = output[0] if isinstance(output, (tuple, list)) else output
+        if not torch.is_tensor(tensor) or tensor.ndim != 4:
+            raise RuntimeError(
+                f"La capa {layer_index} no produjo una activación espacial [B,C,H,W]."
+            )
+        activations["value"] = tensor
+        if tensor.requires_grad:
+            tensor.register_hook(lambda grad: gradients.__setitem__("value", grad))
+
+    hook = target_layer.register_forward_hook(forward_hook)
+    previous_head_training = detect_head.training
+    detect_head.eval()
+    try:
+        # Se usa el mismo preprocesamiento de Ultralytics para la imagen.
+        from ultralytics.data.augment import LetterBox
+        from ultralytics.utils import ops
+
+        im = Image.open(image_path).convert("RGB")
+        orig = np.asarray(im)
+        h0, w0 = orig.shape[:2]
+        # LetterBox mantiene la geometría que usa YOLO para el tamaño solicitado.
+        letterbox = LetterBox(new_shape=(imgsz, imgsz), auto=False, stride=32)
+        padded = letterbox(image=orig)
+        model_device = next(core.parameters()).device
+        tensor = torch.from_numpy(padded).to(model_device)
+        tensor = tensor.permute(2, 0, 1).contiguous().float().unsqueeze(0) / 255.0
+        tensor.requires_grad_(False)
+
+        core.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            raw_output = core(tensor)
+
+            # Ultralytics devuelve (predicciones, datos_auxiliares).
+            # En esta arquitectura las predicciones tienen forma [B, 18, 8400]:
+            # 4 canales de cajas y 14 canales de puntuaciones de clase.
+            prediction_output = (
+                raw_output[0]
+                if isinstance(raw_output, tuple)
+                else raw_output
+            )
+
+            if torch.is_tensor(prediction_output) and prediction_output.ndim == 3:
+                if prediction_output.shape[1] < n_classes:
+                    raise RuntimeError(
+                        "Canales de predicción incompatibles con el número de clases."
+                    )
+
+                class_scores = prediction_output[:, -n_classes:, :]
+                target_score = class_scores[:, selected_class, :].amax()
+
+            else:
+                # Compatibilidad con versiones que devuelven mapas multiescala.
+                raw_maps = raw_detect_outputs(raw_output)
+                class_scores = []
+
+                for feature in raw_maps:
+                    if feature.shape[1] < n_classes:
+                        raise RuntimeError(
+                            "Canales del head Detect incompatibles con nc."
+                        )
+
+                    class_maps = feature[:, -n_classes:, :, :]
+                    class_scores.append(
+                        class_maps[:, selected_class, :, :].amax()
+                    )
+
+                target_score = torch.stack(class_scores).max()
+
+            target_score.backward()
+
+        if "value" not in activations or "value" not in gradients:
+            raise RuntimeError(
+                "No se capturaron activaciones/gradientes. La capa seleccionada "
+                "puede no pertenecer al grafo usado por el head Detect."
+            )
+        acts = activations["value"].detach()
+        grads = gradients["value"].detach()
+        weights = grads.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * acts).sum(dim=1, keepdim=True))[0, 0]
+        cam = cam.cpu().numpy()
+        if not np.isfinite(cam).all() or float(cam.max()) <= 0:
+            raise RuntimeError("Grad-CAM resultó vacío o no finito para esta imagen.")
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        cam = cv2.resize(cam, (w0, h0), interpolation=cv2.INTER_LINEAR)
+
+        heatmap = np.uint8(255 * cam)
+        heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(orig[:, :, ::-1], 0.58, heatmap_color, 0.42, 0)
+
+        # Dibuja las cajas predichas para contextualizar el mapa, sin afirmar
+        # que el mapa corresponde exclusivamente a la caja de mayor confianza.
+        plotted = overlay.copy()
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        for j, coords in enumerate(xyxy):
+            x1, y1, x2, y2 = np.round(coords).astype(int)
+            color = (0, 255, 0) if int(predicted_classes[j]) == selected_class else (255, 255, 255)
+            cv2.rectangle(plotted, (x1, y1), (x2, y2), color, 2)
+            label = f"{class_names[int(predicted_classes[j])]} {confidences[j]:.2f}"
+            cv2.putText(plotted, label, (x1, max(18, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        stem = image_path.stem
+        heat_path = output_dir / f"{stem}_gradcam_heatmap.png"
+        overlay_path = output_dir / f"{stem}_gradcam_overlay.png"
+        cv2.imwrite(str(heat_path), heatmap_color)
+        cv2.imwrite(str(overlay_path), plotted)
+
+        return {
+            "image": str(image_path),
+            "image_name": image_path.name,
+            "split": image_path.parent.name,
+            "target_layer_index": layer_index,
+            "target_layer_type": target_layer.__class__.__name__,
+            "target_class_id": selected_class,
+            "target_class_name": class_names[selected_class],
+            "target_score_class_score": float(target_score.detach().cpu()),
+            "highest_detection_class": class_names[int(predicted_classes[best_idx])],
+            "highest_detection_confidence": float(confidences[best_idx]),
+            "number_of_detections": int(len(boxes)),
+            "heatmap_file": str(heat_path),
+            "overlay_file": str(overlay_path),
+            "status": "OK"
+        }
+    finally:
+        detect_head.train(previous_head_training)
+        hook.remove()
+        core.zero_grad(set_to_none=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Grad-CAM exploratorio para YOLOv8s — Fase 5."
+    )
+    parser.add_argument("--project", type=Path, default=PROJECT_DEFAULT)
+    parser.add_argument("--dataset", type=Path, default=DATASET_DEFAULT)
+    parser.add_argument("--model", type=Path, default=MODEL_DEFAULT)
+    parser.add_argument("--output", type=Path, default=OUTPUT_DEFAULT)
+    parser.add_argument("--split", choices=SPLITS, default="trans_test")
+    parser.add_argument("--images", nargs="*", default=None,
+                        help="Rutas relativas al split o rutas absolutas de imágenes.")
+    parser.add_argument("--limit", type=int, default=5,
+                        help="Número de imágenes seleccionadas automáticamente.")
+    parser.add_argument("--layer", type=int, default=TARGET_LAYER_DEFAULT,
+                        help="Índice de la capa objetivo; 9 es la selección exploratoria del notebook.")
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--class-id", type=int, default=None,
+                        help="Fuerza la clase objetivo (0–13); por defecto usa la detección de mayor confianza.")
+    args = parser.parse_args()
+
+    project = args.project.expanduser()
+    dataset = args.dataset.expanduser()
+    model_path = args.model.expanduser()
+    output_root = args.output.expanduser()
+    if not project.is_dir():
+        raise FileNotFoundError(f"No existe el proyecto: {project}")
+    if not dataset.is_dir():
+        raise FileNotFoundError(f"No existe el dataset: {dataset}")
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            f"No se encuentra best.pt: {model_path}. Verifique su procedencia antes de usar Grad-CAM."
+        )
+    if args.limit < 1:
+        raise ValueError("--limit debe ser >= 1.")
+    if not 0 <= args.conf < 1:
+        raise ValueError("--conf debe estar entre 0 y 1.")
+
+    run_dir = output_root / f"gradcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    images = choose_images(dataset, args.split, args.images, args.limit)
+    print("=" * 72)
+    print("YOLO_CCT20 | FASE 5 — GRAD-CAM")
+    print("=" * 72)
+    print("Modelo:", model_path)
+    print("Split :", args.split)
+    print("Capa  :", args.layer, "(selección exploratoria; verificar arquitectura)")
+    print("Imágenes:", len(images))
+    print("Salida:", run_dir)
+
+    records = []
+    for i, image_path in enumerate(images, start=1):
+        print(f"\n[{i}/{len(images)}] {image_path.name}")
+        try:
+            record = build_cam(
+                model_path, image_path, args.layer, args.imgsz, args.device,
+                args.conf, args.class_id, run_dir
+            )
+            print("  OK:", record["target_class_name"],
+                  f"conf={record['highest_detection_confidence']:.3f}")
+        except Exception as exc:
+            record = {
+                "image": str(image_path), "image_name": image_path.name,
+                "split": args.split, "target_layer_index": args.layer,
+                "status": "ERROR", "error": str(exc)
+            }
+            print("  ERROR:", exc, file=sys.stderr)
+        records.append(record)
+
+    write_csv(run_dir / "gradcam_manifest.csv", records)
+    (run_dir / "metadatos.json").write_text(json.dumps({
+        "model": str(model_path), "dataset": str(dataset),
+        "split": args.split, "target_layer_index": args.layer,
+        "imgsz": args.imgsz, "device": args.device,
+        "confidence_threshold_for_detection_selection": args.conf,
+        "forced_class_id": args.class_id,
+        "method": "Grad-CAM sobre puntuación de clase de la salida diferenciable del head Detect",
+        "interpretation_limit": (
+            "Mapa exploratorio de evidencia de clase; no es explicación causal "
+            "ni atribución exclusiva a una caja individual."
+        ),
+        "generated_at": datetime.now().astimezone().isoformat()
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    ok = sum(r.get("status") == "OK" for r in records)
+    print(f"\nFinalizado: {ok}/{len(records)} mapas generados.")
+    print("Resultados:", run_dir)
+    print("No se entrenó el modelo ni se modificó el dataset o best.pt.")
+    return 0 if ok else 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        raise

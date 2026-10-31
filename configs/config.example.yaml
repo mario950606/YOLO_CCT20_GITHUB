@@ -1,0 +1,56 @@
+# Copiar como configs/config.yaml y completar con rutas locales.
+# No publicar configs/config.yaml porque contiene rutas del entorno de ejecución.
+
+paths:
+  project: "."
+  cct20_root: "/RUTA/AL/DATASET/CCT20"
+  dataset: "/RUTA/AL/DATASET_YOLO_PREPARADO"
+  model: "/RUTA/AL/MODELO/best.pt"
+  initial_weights: "weights/yolov8s.pt"
+  results: "/RUTA/DE/SALIDA/resultados_fase5_6_integrados"
+  manual_occlusion_csv: "/RUTA/AL/anotacion_rapida_24.csv"
+  size_metrics: "/RUTA/AL/fase5_metricas_por_clase"
+  annotations_json: "/RUTA/AL/CCT20/eccv_18_annotation_files"
+  original_images: "/RUTA/AL/CCT20/eccv_18_all_images_sm"
+
+training:
+  epochs: 50
+  imgsz: 640
+  batch: 8
+  device: "cpu"
+  workers: 2
+  seed: 0
+  val_split: "cis_val"
+
+evaluation:
+  imgsz: 640
+  batch: 8
+  device: "cpu"
+  workers: 2
+
+monitoring:
+  split: "trans_test"
+  max_images: 500
+  confidence: 0.25
+  iou: 0.70
+  image_size: 640
+  device: "cpu"
+  target_location: null
+  location_field: null
+  datetime_field: null
+
+classes:
+  - badger
+  - bird
+  - bobcat
+  - cat
+  - coyote
+  - deer
+  - dog
+  - fox
+  - opossum
+  - rabbit
+  - raccoon
+  - rodent
+  - skunk
+  - squirrel
